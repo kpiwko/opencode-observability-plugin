@@ -7,6 +7,7 @@ import { Data, Effect, Layer, Option, Schema } from "effect";
 
 import {
   LangfuseClientService,
+  buildSessionHistory,
   createLangfuseClient,
   type LangfuseClient,
   type ToolDefinition,
@@ -77,6 +78,37 @@ const loadLangfuseCredentials = Effect.gen(function* () {
 
   return credentials;
 });
+
+const refreshSessionHistory = (sessionID: string) =>
+  Effect.gen(function* () {
+    const opencode = yield* OpencodeClientService;
+    const langfuse = yield* LangfuseClientService;
+    const response = yield* Effect.tryPromise({
+      try: () => opencode.session.messages({ path: { id: sessionID } }),
+      catch: (error) => error,
+    }).pipe(
+      Effect.catchAll((error) =>
+        log(
+          "info",
+          `Reading the conversation of session ${sessionID} failed: ${formatHookError(error)}`,
+        ).pipe(Effect.as(undefined)),
+      ),
+    );
+
+    if (response === undefined) {
+      return;
+    }
+
+    if (response.data === undefined) {
+      yield* log(
+        "info",
+        `OpenCode returned no messages for session ${sessionID}; keeping the previous conversation snapshot`,
+      );
+      return;
+    }
+
+    langfuse.setSessionHistory(sessionID, buildSessionHistory(response.data));
+  });
 
 const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
   Effect.gen(function* () {
@@ -178,6 +210,7 @@ const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
     }
 
     if (event.type === "session.next.step.started") {
+      yield* refreshSessionHistory(event.properties.sessionID);
       langfuse.startActiveGenerationStep({
         sessionID: event.properties.sessionID,
         assistantMessageID:
@@ -268,6 +301,10 @@ const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
 
       if (message.role !== "assistant") {
         return;
+      }
+
+      if (!langfuse.hasSessionHistory(message.sessionID)) {
+        yield* refreshSessionHistory(message.sessionID);
       }
 
       langfuse.startActiveGenerationStep({

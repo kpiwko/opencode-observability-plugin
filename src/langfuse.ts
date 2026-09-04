@@ -47,6 +47,8 @@ export class LangfuseClient {
     this.traceState.latestTurnObservationsBySession.clear();
     this.traceState.finalizedToolCallIds.clear();
     this.traceState.sessionParentIds.clear();
+    this.traceState.sessionHistories.clear();
+    this.traceState.pendingUserMessageIdsBySession.clear();
   }
 
   clearSessionTraceState(sessionID: string) {
@@ -101,6 +103,8 @@ export class LangfuseClient {
     this.traceState.generationInputsBySession.delete(sessionID);
     this.traceState.toolResultSourceMessageIdsBySession.delete(sessionID);
     this.traceState.latestTurnObservationsBySession.delete(sessionID);
+    this.traceState.sessionHistories.delete(sessionID);
+    this.traceState.pendingUserMessageIdsBySession.delete(sessionID);
   }
 
   endActiveToolObservations(sessionID?: string, error?: SessionErrorInfo) {
@@ -427,7 +431,10 @@ export class LangfuseClient {
       return;
     }
 
-    const generationInput = this.consumeGenerationInput(input.sessionID);
+    const generationInput = this.consumeGenerationInput(
+      input.sessionID,
+      input.assistantMessageID,
+    );
 
     this.withTurnParent(input.sessionID, undefined, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
@@ -486,44 +493,7 @@ export class LangfuseClient {
 
     this.traceState.abortedSessions.delete(input.sessionID);
 
-    const formattedMessage = {
-      role: "user" as const,
-      content: input.parts.map((part) => {
-        if (part.type === "text") {
-          return { type: part.type, text: part.text };
-        }
-
-        if (part.type === "file") {
-          return {
-            type: part.type,
-            filename: part.filename,
-            url: part.url,
-          };
-        }
-
-        if (part.type === "agent") {
-          return { type: part.type, name: part.name };
-        }
-
-        if (part.type === "subtask") {
-          return {
-            type: part.type,
-            prompt: part.prompt,
-            agent: part.agent,
-          };
-        }
-
-        if (part.type === "tool") {
-          return {
-            type: part.type,
-            tool: part.tool,
-            title: "title" in part.state ? part.state.title : undefined,
-          };
-        }
-
-        return { type: part.type };
-      }),
-    };
+    const formattedMessage = formatUserMessage(input.parts);
     const generationInput = [
       {
         ...formattedMessage,
@@ -538,6 +508,10 @@ export class LangfuseClient {
 
     if (input.messageID != null) {
       this.traceState.tracedMessageIds.add(input.messageID);
+      this.traceState.pendingUserMessageIdsBySession.set(
+        input.sessionID,
+        input.messageID,
+      );
     }
 
     const previousTurn = this.traceState.latestTurnObservationsBySession.get(
@@ -769,7 +743,10 @@ export class LangfuseClient {
       return;
     }
 
-    const generationInput = this.consumeGenerationInput(input.sessionID);
+    const generationInput = this.consumeGenerationInput(
+      input.sessionID,
+      input.messageID,
+    );
 
     this.withTurnParent(input.sessionID, input.parentID, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
@@ -1197,65 +1174,111 @@ export class LangfuseClient {
   }
 
   private getAssistantMessage(messageID: string) {
-    const parts = Array.from(
-      this.traceState.assistantParts.get(messageID)?.values() ?? [],
+    return buildAssistantMessage(
+      Array.from(this.traceState.assistantParts.get(messageID)?.values() ?? []),
     );
-    const content = parts
-      .filter(
-        (part): part is Extract<MessagePart, { type: "text" }> =>
-          part.type === "text" && part.text !== "",
-      )
-      .map((part) => part.text)
-      .join("");
-    const thinking = parts
-      .filter(
-        (part): part is Extract<MessagePart, { type: "reasoning" }> =>
-          part.type === "reasoning" && part.text !== "",
-      )
-      .map((part) => ({ type: "thinking" as const, content: part.text }));
-    const toolCallsById = new Map(
-      parts
-        .filter(
-          (part): part is Extract<MessagePart, { type: "tool" }> =>
-            part.type === "tool",
-        )
-        .map((part) => [part.callID, part] as const),
-    );
-    const toolCalls = Array.from(toolCallsById.values()).map((part) => ({
-      id: part.callID,
-      name: part.tool,
-      arguments: JSON.stringify(part.state.input),
-    }));
-
-    if (!content && thinking.length === 0 && toolCalls.length === 0) {
-      return undefined;
-    }
-
-    return [
-      {
-        role: "assistant" as const,
-        ...(content ? { content } : {}),
-        ...(thinking.length ? { thinking } : {}),
-        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-      },
-    ];
   }
 
-  private consumeGenerationInput(sessionID: string) {
-    const input = this.traceState.generationInputsBySession.get(sessionID);
+  setSessionHistory(sessionID: string, history: SessionHistory) {
+    this.traceState.sessionHistories.set(sessionID, history);
+  }
+
+  hasSessionHistory(sessionID: string) {
+    return this.traceState.sessionHistories.has(sessionID);
+  }
+
+  private getHistoryPrefix(sessionID: string, assistantMessageID?: string) {
+    const history = this.traceState.sessionHistories.get(sessionID);
+
+    if (!history) {
+      return [];
+    }
+
+    if (assistantMessageID == null) {
+      return history.messages;
+    }
+
+    const startIndex =
+      history.startIndexByAssistantMessageId.get(assistantMessageID);
+
+    return startIndex == null
+      ? history.messages
+      : history.messages.slice(0, startIndex);
+  }
+
+  // True only when the snapshot provably holds that message. A failed refresh
+  // leaves the previous snapshot in place, and that one predates the request.
+  private snapshotHolds(sessionID: string, messageID: string | undefined) {
+    if (messageID == null) {
+      return false;
+    }
+
+    return (
+      this.traceState.sessionHistories
+        .get(sessionID)
+        ?.messageIds.has(messageID) === true
+    );
+  }
+
+  private consumeGenerationInput(
+    sessionID: string,
+    assistantMessageID?: string,
+  ) {
+    const pending = this.traceState.generationInputsBySession.get(sessionID);
     const sourceMessageID =
       this.traceState.toolResultSourceMessageIdsBySession.get(sessionID);
+    const pendingUserMessageID =
+      this.traceState.pendingUserMessageIdsBySession.get(sessionID);
     this.traceState.generationInputsBySession.delete(sessionID);
     this.traceState.toolResultSourceMessageIdsBySession.delete(sessionID);
 
-    if (sourceMessageID == null) {
-      return input;
+    const assistantOfToolResults =
+      sourceMessageID == null
+        ? []
+        : (this.getAssistantMessage(sourceMessageID) ?? []);
+    const prefix = this.getHistoryPrefix(sessionID, assistantMessageID);
+
+    if (prefix.length === 0) {
+      // No snapshot from OpenCode yet, so the live delta is all there is.
+      return sourceMessageID == null
+        ? pending
+        : [...assistantOfToolResults, ...(pending ?? [])];
     }
 
-    return [
-      ...(this.getAssistantMessage(sourceMessageID) ?? []),
-      ...(input ?? []),
+    // Taking the user message from both sources would list it twice, so it
+    // comes from the live buffer only when the snapshot does not hold it -
+    // after a failed refresh, or when the store had not caught up yet. The
+    // buffer's copy already carries this request's tool definitions.
+    const pendingUserMessages = this.snapshotHolds(
+      sessionID,
+      pendingUserMessageID,
+    )
+      ? []
+      : (pending ?? []).filter((message) => message.role === "user");
+    const toolResults = (pending ?? []).filter(
+      (message) => message.role === "tool",
+    );
+    const combined = [
+      ...prefix,
+      ...assistantOfToolResults,
+      ...toolResults,
+      ...pendingUserMessages,
     ];
+
+    if (pendingUserMessages.length > 0) {
+      return combined;
+    }
+
+    // Tool definitions describe this request, not the stored conversation, so
+    // they ride on its newest user message.
+    const tools = pending?.find(
+      (message): message is Extract<ChatMlMessage, { role: "user" }> =>
+        message.role === "user" && "tools" in message,
+    )?.tools;
+
+    return tools === undefined
+      ? combined
+      : withToolDefinitions(combined, tools);
   }
 
   private rememberToolResult(input: {
@@ -1325,12 +1348,198 @@ export type LangfuseTraceState = {
   generationInputsBySession: Map<string, ChatMlMessage[]>;
   toolResultSourceMessageIdsBySession: Map<string, string>;
   sessionParentIds: Map<string, string>;
+  sessionHistories: Map<string, SessionHistory>;
+  pendingUserMessageIdsBySession: Map<string, string>;
 };
 
 export type MessagePart = Extract<
   Parameters<NonNullable<Hooks["event"]>>[0]["event"],
   { type: "message.part.updated" }
 >["properties"]["part"];
+
+export type SessionHistory = {
+  messages: ChatMlMessage[];
+  startIndexByAssistantMessageId: Map<string, number>;
+  // Which messages the snapshot actually holds. A stale snapshot - the last
+  // refresh failed, or it ran before the message existed - does not contain
+  // the request that triggered the generation, and the live buffer has to
+  // supply it.
+  messageIds: Set<string>;
+};
+
+function splitAssistantSteps(parts: MessagePart[]) {
+  const steps: MessagePart[][] = [];
+  let current: MessagePart[] = [];
+
+  for (const part of parts) {
+    if (part.type === "step-start" && current.length > 0) {
+      steps.push(current);
+      current = [];
+      continue;
+    }
+
+    if (part.type !== "step-start") {
+      current.push(part);
+    }
+  }
+
+  if (current.length > 0) {
+    steps.push(current);
+  }
+
+  return steps;
+}
+
+function toolResultContent(
+  state: Extract<MessagePart, { type: "tool" }>["state"],
+) {
+  if ("output" in state) {
+    return state.output;
+  }
+
+  return "error" in state ? state.error : "";
+}
+
+function toolResultsOfStep(parts: MessagePart[]): ChatMlMessage[] {
+  return parts
+    .filter(
+      (part): part is Extract<MessagePart, { type: "tool" }> =>
+        part.type === "tool" &&
+        (part.state.status === "completed" || part.state.status === "error"),
+    )
+    .map((part) => ({
+      role: "tool" as const,
+      name: part.tool,
+      tool_call_id: part.callID,
+      content: toolResultContent(part.state),
+    }));
+}
+
+export function buildSessionHistory(
+  messages: readonly {
+    info: { id: string; role: string };
+    parts: MessagePart[];
+  }[],
+): SessionHistory {
+  const history: ChatMlMessage[] = [];
+  const startIndexByAssistantMessageId = new Map<string, number>();
+  const messageIds = new Set<string>();
+
+  for (const message of messages) {
+    messageIds.add(message.info.id);
+
+    if (message.info.role === "user") {
+      history.push(formatUserMessage(message.parts));
+      continue;
+    }
+
+    startIndexByAssistantMessageId.set(message.info.id, history.length);
+
+    for (const step of splitAssistantSteps(message.parts)) {
+      const assistant = buildAssistantMessage(step);
+
+      if (assistant) {
+        history.push(...assistant);
+      }
+
+      history.push(...toolResultsOfStep(step));
+    }
+  }
+
+  return { messages: history, startIndexByAssistantMessageId, messageIds };
+}
+
+function withToolDefinitions(
+  messages: ChatMlMessage[],
+  tools: ToolDefinition[],
+): ChatMlMessage[] {
+  const newestUserIndex = messages.reduce(
+    (found, message, index) => (message.role === "user" ? index : found),
+    -1,
+  );
+
+  if (newestUserIndex < 0) {
+    return messages;
+  }
+
+  return messages.map((message, index) =>
+    index === newestUserIndex ? { ...message, tools } : message,
+  );
+}
+
+function formatUserMessagePart(part: MessagePart): FormattedMessagePart {
+  if (part.type === "text") {
+    return { type: part.type, text: part.text };
+  }
+
+  if (part.type === "file") {
+    return { type: part.type, filename: part.filename, url: part.url };
+  }
+
+  if (part.type === "agent") {
+    return { type: part.type, name: part.name };
+  }
+
+  if (part.type === "subtask") {
+    return { type: part.type, prompt: part.prompt, agent: part.agent };
+  }
+
+  if (part.type === "tool") {
+    return {
+      type: part.type,
+      tool: part.tool,
+      title: "title" in part.state ? part.state.title : undefined,
+    };
+  }
+
+  return { type: part.type };
+}
+
+function formatUserMessage(parts: MessagePart[]) {
+  return { role: "user" as const, content: parts.map(formatUserMessagePart) };
+}
+
+function buildAssistantMessage(parts: MessagePart[]) {
+  const content = parts
+    .filter(
+      (part): part is Extract<MessagePart, { type: "text" }> =>
+        part.type === "text" && part.text !== "",
+    )
+    .map((part) => part.text)
+    .join("");
+  const thinking = parts
+    .filter(
+      (part): part is Extract<MessagePart, { type: "reasoning" }> =>
+        part.type === "reasoning" && part.text !== "",
+    )
+    .map((part) => ({ type: "thinking" as const, content: part.text }));
+  const toolCallsById = new Map(
+    parts
+      .filter(
+        (part): part is Extract<MessagePart, { type: "tool" }> =>
+          part.type === "tool",
+      )
+      .map((part) => [part.callID, part] as const),
+  );
+  const toolCalls = Array.from(toolCallsById.values()).map((part) => ({
+    id: part.callID,
+    name: part.tool,
+    arguments: JSON.stringify(part.state.input),
+  }));
+
+  if (!content && thinking.length === 0 && toolCalls.length === 0) {
+    return undefined;
+  }
+
+  return [
+    {
+      role: "assistant" as const,
+      ...(content ? { content } : {}),
+      ...(thinking.length ? { thinking } : {}),
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    },
+  ];
+}
 
 function getCompletedReasoningTimestamp(part: MessagePart) {
   if (!("time" in part) || !part.time || typeof part.time !== "object") {
@@ -1483,6 +1692,8 @@ export const createLangfuseClient = (input: {
       generationInputsBySession: new Map<string, ChatMlMessage[]>(),
       toolResultSourceMessageIdsBySession: new Map<string, string>(),
       sessionParentIds: new Map<string, string>(),
+      sessionHistories: new Map<string, SessionHistory>(),
+      pendingUserMessageIdsBySession: new Map<string, string>(),
     };
 
     const processor = new LangfuseSpanProcessor({
