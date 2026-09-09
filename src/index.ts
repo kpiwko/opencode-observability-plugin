@@ -151,9 +151,27 @@ const refreshSessionHistory = (sessionID: string) =>
     langfuse.setSessionHistory(sessionID, buildSessionHistory(response.data));
   });
 
-const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
+const eventHook = (
+  event: OpencodeEvent,
+  shutdown?: () => Promise<void>,
+  ensureSessionLineage?: (sessionID: string) => Promise<void>,
+) =>
   Effect.gen(function* () {
     const langfuse = yield* LangfuseClientService;
+
+    const eventSessionID =
+      "sessionID" in event.properties &&
+      typeof event.properties.sessionID === "string"
+        ? event.properties.sessionID
+        : event.type === "message.updated"
+          ? event.properties.info.sessionID
+          : event.type === "message.part.updated"
+            ? event.properties.part.sessionID
+            : undefined;
+
+    if (eventSessionID && ensureSessionLineage) {
+      yield* Effect.promise(() => ensureSessionLineage(eventSessionID));
+    }
 
     const finalizeSessionTracing = (sessionID?: string) => {
       langfuse.endActiveToolObservations(sessionID);
@@ -495,7 +513,8 @@ const main = Effect.gen(function* () {
     return {};
   }
 
-  langfuse.configureSessionGrouping(yield* SessionGroupingOptionsService);
+  const sessionGrouping = yield* SessionGroupingOptionsService;
+  langfuse.configureSessionGrouping(sessionGrouping);
 
   const hooksLayer = Layer.merge(
     Layer.succeed(OpencodeClientService, opencode),
@@ -510,6 +529,57 @@ const main = Effect.gen(function* () {
   });
   const shutdownOnce = createShutdownOnce(langfuse);
   const toolDefinitions = new Map<string, Promise<ToolDefinition[]>>();
+  const sessionLineageHydrations = new Map<string, Promise<void>>();
+
+  const ensureSessionLineage = (sessionID: string): Promise<void> => {
+    if (!sessionGrouping.enabled) {
+      return Promise.resolve();
+    }
+
+    const existing = sessionLineageHydrations.get(sessionID);
+    if (existing) {
+      return existing;
+    }
+
+    const hydration = (async () => {
+      const visited = new Set<string>();
+      let currentSessionID = sessionID;
+
+      while (!visited.has(currentSessionID)) {
+        visited.add(currentSessionID);
+
+        const response = await opencode.session.get({
+          path: { id: currentSessionID },
+        });
+        const info = response.data;
+        if (!info) {
+          return;
+        }
+
+        langfuse.rememberSessionParent({
+          sessionID: info.id,
+          parentSessionID: info.parentID,
+        });
+
+        if (!info.parentID) {
+          return;
+        }
+
+        currentSessionID = info.parentID;
+      }
+    })().catch(async (error) => {
+      sessionLineageHydrations.delete(sessionID);
+      await Effect.runPromise(
+        log(
+          "info",
+          `Resolving session lineage for ${sessionID} failed: ${formatHookError(error)}`,
+        ),
+      );
+    });
+
+    sessionLineageHydrations.set(sessionID, hydration);
+    return hydration;
+  };
 
   const runHook = (
     hookName: string,
@@ -565,12 +635,18 @@ const main = Effect.gen(function* () {
         }),
       ),
 
-    event: ({ event }) => runHook("event", eventHook(event, shutdownOnce)),
+    event: ({ event }) =>
+      runHook(
+        "event",
+        eventHook(event, shutdownOnce, ensureSessionLineage),
+      ),
 
     "chat.message": (input, output) =>
       runHook(
         "chat.message",
         Effect.gen(function* () {
+          yield* Effect.promise(() => ensureSessionLineage(input.sessionID));
+
           let tools: ToolDefinition[] | undefined;
 
           if (input.model) {
@@ -631,16 +707,19 @@ const main = Effect.gen(function* () {
     "tool.execute.before": (input, output) =>
       runHook(
         "tool.execute.before",
-        Effect.try({
-          try: () => {
-            langfuse.traceToolStart({
-              sessionID: input.sessionID,
-              callID: input.callID,
-              tool: input.tool,
-              args: output.args,
-            });
-          },
-          catch: (error) => error,
+        Effect.gen(function* () {
+          yield* Effect.promise(() => ensureSessionLineage(input.sessionID));
+          yield* Effect.try({
+            try: () => {
+              langfuse.traceToolStart({
+                sessionID: input.sessionID,
+                callID: input.callID,
+                tool: input.tool,
+                args: output.args,
+              });
+            },
+            catch: (error) => error,
+          });
         }),
       ),
 
@@ -648,6 +727,7 @@ const main = Effect.gen(function* () {
       runHook(
         "tool.execute.after",
         Effect.gen(function* () {
+          yield* Effect.promise(() => ensureSessionLineage(input.sessionID));
           const normalized = normalizeToolResult(input.tool, output);
 
           if (normalized.unexpected) {
