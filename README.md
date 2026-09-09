@@ -17,6 +17,32 @@ Enable the plugin in your `opencode.json` or `opencode.jsonc`:
 
 Restart OpenCode after changing the config.
 
+### OpenCode conversation sessions
+
+By default the plugin keeps its existing trace behavior. To group all turns in
+one OpenCode conversation into one Langfuse Session, enable `sessionGrouping`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "@langfuse/opencode-observability-plugin",
+      "options": {
+        "sessionGrouping": {
+          "enabled": true,
+        },
+      },
+    },
+  ],
+}
+```
+
+The Langfuse Session ID is the root OpenCode conversation/session ID. Each
+user-to-assistant turn remains an individual Langfuse trace, with model calls,
+tools, and nested sessions kept as observations below that trace. Set
+`enabled` to `false`, or omit `sessionGrouping`, to retain ungrouped behavior.
+
 ## Supported Versions
 
 We aim to support a wide range of OpenCode v1 versions, including older event

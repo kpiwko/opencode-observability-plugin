@@ -107,6 +107,14 @@ export class LangfuseClient {
     this.traceState.pendingUserMessageIdsBySession.delete(sessionID);
   }
 
+  configureSessionGrouping(input: {
+    enabled: boolean;
+    project?: string;
+    directory?: string;
+  }) {
+    this.traceState.sessionGrouping = input;
+  }
+
   endActiveToolObservations(sessionID?: string, error?: SessionErrorInfo) {
     for (const [callID, observation] of this.traceState
       .activeToolObservations) {
@@ -528,6 +536,7 @@ export class LangfuseClient {
     const parentSessionID = this.traceState.sessionParentIds.get(
       input.sessionID,
     );
+    const sessionContext = this.getSessionContext(input.sessionID);
     const parentSpan = this.getSessionParentSpan(input.sessionID);
     const startTurn = () => {
       const span = this.traceState.tracer.startSpan("opencode.turn", {
@@ -535,6 +544,34 @@ export class LangfuseClient {
           "langfuse.observation.type": "agent",
           "langfuse.internal.is_app_root": !parentSpan,
           "session.id": input.sessionID,
+          ...(sessionContext
+            ? {
+                "langfuse.session.id": sessionContext.rootSessionID,
+                "opencode.session.id": input.sessionID,
+                "opencode.session.root_id": sessionContext.rootSessionID,
+                ...(sessionContext.parentSessionID !== undefined &&
+                sessionContext.parentSessionID !== ""
+                  ? {
+                      "opencode.session.parent_id":
+                        sessionContext.parentSessionID,
+                    }
+                  : {}),
+                ...(this.traceState.sessionGrouping.project !== undefined &&
+                this.traceState.sessionGrouping.project !== ""
+                  ? {
+                      "opencode.project":
+                        this.traceState.sessionGrouping.project,
+                    }
+                  : {}),
+                ...(this.traceState.sessionGrouping.directory !== undefined &&
+                this.traceState.sessionGrouping.directory !== ""
+                  ? {
+                      "opencode.directory":
+                        this.traceState.sessionGrouping.directory,
+                    }
+                  : {}),
+              }
+            : {}),
           "langfuse.observation.input": JSON.stringify([formattedMessage]),
           "langfuse.observation.metadata": JSON.stringify({
             messageID: input.messageID,
@@ -1156,6 +1193,27 @@ export class LangfuseClient {
     );
   }
 
+  private getSessionContext(sessionID: string) {
+    if (!this.traceState.sessionGrouping.enabled) {
+      return undefined;
+    }
+
+    const visited = new Set<string>();
+    let current = sessionID;
+    let parentSessionID = this.traceState.sessionParentIds.get(current);
+
+    while (parentSessionID != null && !visited.has(current)) {
+      visited.add(current);
+      current = parentSessionID;
+      parentSessionID = this.traceState.sessionParentIds.get(current);
+    }
+
+    return {
+      rootSessionID: current,
+      parentSessionID: this.traceState.sessionParentIds.get(sessionID),
+    };
+  }
+
   private withObservationParent<T>(
     sessionID: string,
     fn: () => T,
@@ -1350,6 +1408,11 @@ export type LangfuseTraceState = {
   sessionParentIds: Map<string, string>;
   sessionHistories: Map<string, SessionHistory>;
   pendingUserMessageIdsBySession: Map<string, string>;
+  sessionGrouping: {
+    enabled: boolean;
+    project?: string;
+    directory?: string;
+  };
 };
 
 export type MessagePart = Extract<
@@ -1694,6 +1757,7 @@ export const createLangfuseClient = (input: {
       sessionParentIds: new Map<string, string>(),
       sessionHistories: new Map<string, SessionHistory>(),
       pendingUserMessageIdsBySession: new Map<string, string>(),
+      sessionGrouping: { enabled: false },
     };
 
     const processor = new LangfuseSpanProcessor({

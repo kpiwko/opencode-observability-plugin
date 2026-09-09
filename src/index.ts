@@ -2,8 +2,8 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { Hooks, Plugin } from "@opencode-ai/plugin";
-import { Data, Effect, Layer, Option, Schema } from "effect";
+import type { Hooks, Plugin, PluginOptions } from "@opencode-ai/plugin";
+import { Context, Data, Effect, Layer, Option, Schema } from "effect";
 
 import {
   LangfuseClientService,
@@ -17,6 +17,7 @@ import {
   McpContentSchema,
   McpToolResultSchema,
   NativeToolResultSchema,
+  SessionGroupingConfigSchema,
   type OpencodeEvent,
 } from "./schema.js";
 import { log } from "./utils.js";
@@ -31,6 +32,46 @@ const LangfuseCredentialsSchema = Schema.Struct({
 });
 
 type LangfuseCredentials = typeof LangfuseCredentialsSchema.Type;
+
+type SessionGroupingOptions = {
+  enabled: boolean;
+};
+
+const SessionGroupingOptionsService = Context.GenericTag<
+  SessionGroupingOptions & {
+    project?: string;
+    directory?: string;
+  }
+>("LangfuseSessionGroupingOptions");
+
+const readPluginOptions = (options: PluginOptions | undefined) => {
+  const config = options?.sessionGrouping;
+
+  if (config === undefined) {
+    return {
+      enabled: false,
+    } satisfies SessionGroupingOptions;
+  }
+
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    throw new Error(
+      'Invalid Langfuse plugin configuration: "sessionGrouping" must be an object',
+    );
+  }
+
+  const decoded = Schema.decodeUnknownOption(SessionGroupingConfigSchema)(
+    config,
+  );
+  if (Option.isNone(decoded)) {
+    throw new Error(
+      'Invalid Langfuse plugin configuration: "sessionGrouping.enabled" must be a boolean',
+    );
+  }
+
+  return {
+    enabled: decoded.value.enabled ?? true,
+  } satisfies SessionGroupingOptions;
+};
 
 class MissingLangfuseCredentials extends Data.TaggedError(
   "MissingLangfuseCredentials",
@@ -454,6 +495,8 @@ const main = Effect.gen(function* () {
     return {};
   }
 
+  langfuse.configureSessionGrouping(yield* SessionGroupingOptionsService);
+
   const hooksLayer = Layer.merge(
     Layer.succeed(OpencodeClientService, opencode),
     Layer.succeed(LangfuseClientService, langfuse),
@@ -650,10 +693,29 @@ const main = Effect.gen(function* () {
   return hooks;
 });
 
-const LangfusePlugin: Plugin = async ({ client }) => {
-  const clientLayer = Layer.succeed(OpencodeClientService, client);
+const LangfusePluginImpl = async (
+  {
+    client,
+    project,
+    directory,
+  }: Omit<Parameters<Plugin>[0], "project"> & {
+    project?: Parameters<Plugin>[0]["project"];
+  },
+  options: PluginOptions | undefined,
+) => {
+  const clientLayer = Layer.merge(
+    Layer.succeed(OpencodeClientService, client),
+    Layer.succeed(SessionGroupingOptionsService, {
+      ...readPluginOptions(options),
+      project: project?.id,
+      directory,
+    }),
+  );
 
   return Effect.runPromise(main.pipe(Effect.provide(clientLayer)));
 };
+
+const LangfusePlugin: Plugin = (input, options) =>
+  LangfusePluginImpl(input, options);
 
 export default LangfusePlugin;
