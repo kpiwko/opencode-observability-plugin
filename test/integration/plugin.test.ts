@@ -455,7 +455,10 @@ const completeGeneration = async (input: {
   });
 };
 
-const createHooks = async (baseUrl: string) => {
+const createHooks = async (
+  baseUrl: string,
+  options?: { sessionGrouping?: { enabled?: boolean } },
+) => {
   process.env.LANGFUSE_BASE_URL = baseUrl;
   const client = Schema.decodeUnknownSync(PluginClientSchema)({
     app: {
@@ -501,7 +504,10 @@ const createHooks = async (baseUrl: string) => {
     },
   });
 
-  return plugin(Schema.decodeUnknownSync(PluginInputSchema)({ client }));
+  return plugin(
+    Schema.decodeUnknownSync(PluginInputSchema)({ client }),
+    options,
+  );
 };
 
 const disposeHooks = async () => {
@@ -709,6 +715,8 @@ describe("built plugin", { concurrent: false }, () => {
       expect(getAttributes(turn)).toMatchObject({
         "langfuse.observation.type": "agent",
       });
+      expect(getAttributes(turn)["langfuse.session.id"]).toBeUndefined();
+      expect(getAttributes(turn)["opencode.session.id"]).toBeUndefined();
     }
 
     const firstGeneration = spans
@@ -1229,6 +1237,12 @@ describe("built plugin", { concurrent: false }, () => {
   });
 
   test("links child agent sessions to the parent trace", async () => {
+    await disposeHooks();
+    hooksDisposed = false;
+    hooks = await createHooks(collectorBaseUrl, {
+      sessionGrouping: { enabled: true },
+    });
+
     const parentSessionID = "parent-agent-session";
     const childSessionID = "child-agent-session";
     const parentUserMessageID = "parent-agent-user";
@@ -1311,6 +1325,10 @@ describe("built plugin", { concurrent: false }, () => {
     expect(childTurn.parentSpanId).toBe(parentGeneration.spanId);
     expect(getAttributes(childTurn)).toMatchObject({
       "langfuse.internal.is_app_root": false,
+      "langfuse.session.id": parentSessionID,
+      "opencode.session.id": childSessionID,
+      "opencode.session.root_id": parentSessionID,
+      "opencode.session.parent_id": parentSessionID,
     });
     expect(
       getJsonAttribute(childTurn, "langfuse.observation.metadata"),
@@ -1322,6 +1340,41 @@ describe("built plugin", { concurrent: false }, () => {
     expect(
       getJsonAttribute(parentGeneration, "langfuse.observation.output"),
     ).toEqual([{ role: "assistant", content: "Parent result" }]);
+  });
+
+  test("leaves Langfuse sessions ungrouped when session grouping is disabled", async () => {
+    await disposeHooks();
+    hooksDisposed = false;
+    hooks = await createHooks(collectorBaseUrl, {
+      sessionGrouping: { enabled: false },
+    });
+
+    const sessionID = "ungrouped-session";
+    await sendUserMessage({
+      sessionID,
+      messageID: "ungrouped-user",
+      text: "Keep this session ungrouped",
+      started: startedAt,
+    });
+    await startGeneration({
+      id: "ungrouped-step",
+      sessionID,
+      started: startedAt + 100,
+    });
+    await completeGeneration({
+      sessionID,
+      userMessageID: "ungrouped-user",
+      assistantMessageID: "ungrouped-assistant",
+      started: startedAt + 100,
+      completed: startedAt + 500,
+      text: "Ungrouped",
+    });
+
+    const { spans } = await flushSession(sessionID);
+    for (const span of spans) {
+      expect(getAttributes(span)["langfuse.session.id"]).toBeUndefined();
+      expect(getAttributes(span)["opencode.session.id"]).toBeUndefined();
+    }
   });
 
   test("parents each tool to the generation that requested it when lifecycle events arrive out of order", async () => {

@@ -8,6 +8,12 @@ import { Schema } from "effect";
 
 import type { LangfuseClient } from "./langfuse.js";
 
+export const SessionGroupingConfigSchema = Schema.Struct({
+  enabled: Schema.optional(Schema.Boolean),
+});
+
+export type SessionGroupingConfig = typeof SessionGroupingConfigSchema.Type;
+
 // Retained from v1.15.13 for compatibility with its step-start payload.
 // https://github.com/anomalyco/opencode/blob/v1.15.13/packages/core/src/session-event.ts#L103-L114
 type LegacySessionNextStepStartedEvent = {
