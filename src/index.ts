@@ -37,6 +37,25 @@ type SessionGroupingOptions = {
   enabled: boolean;
 };
 
+type SessionInfo = {
+  id: string;
+  parentID?: string;
+  title?: string;
+};
+
+type TurnMetadataState = {
+  traceState: {
+    latestTurnObservationsBySession: Map<
+      string,
+      {
+        span: {
+          setAttribute: (key: string, value: string) => void;
+        };
+      }
+    >;
+  };
+};
+
 const SessionGroupingOptionsService = Context.GenericTag<
   SessionGroupingOptions & {
     project?: string;
@@ -155,6 +174,7 @@ const eventHook = (
   event: OpencodeEvent,
   shutdown?: () => Promise<void>,
   ensureSessionLineage?: (sessionID: string) => Promise<void>,
+  rememberSessionInfo?: (info: SessionInfo) => void,
 ) =>
   Effect.gen(function* () {
     const langfuse = yield* LangfuseClientService;
@@ -204,6 +224,7 @@ const eventHook = (
     }
 
     if (event.type === "session.created" || event.type === "session.updated") {
+      rememberSessionInfo?.(event.properties.info);
       langfuse.rememberSessionParent({
         sessionID: event.properties.info.id,
         parentSessionID: event.properties.info.parentID,
@@ -530,6 +551,62 @@ const main = Effect.gen(function* () {
   const shutdownOnce = createShutdownOnce(langfuse);
   const toolDefinitions = new Map<string, Promise<ToolDefinition[]>>();
   const sessionLineageHydrations = new Map<string, Promise<void>>();
+  const sessionParents = new Map<string, string>();
+  const sessionTitles = new Map<string, string>();
+
+  const rememberSessionInfo = (info: SessionInfo) => {
+    if (info.parentID) {
+      sessionParents.set(info.id, info.parentID);
+    } else {
+      sessionParents.delete(info.id);
+    }
+
+    if (typeof info.title === "string" && info.title !== "") {
+      sessionTitles.set(info.id, info.title);
+    }
+  };
+
+  const getRootSessionTitle = (sessionID: string) => {
+    const visited = new Set<string>();
+    let currentSessionID = sessionID;
+
+    while (!visited.has(currentSessionID)) {
+      visited.add(currentSessionID);
+      const parentSessionID = sessionParents.get(currentSessionID);
+      if (!parentSessionID) {
+        break;
+      }
+      currentSessionID = parentSessionID;
+    }
+
+    return sessionTitles.get(currentSessionID);
+  };
+
+  const annotateActiveTurnWithSessionTitle = (
+    sessionID: string,
+    title: string | undefined,
+  ) => {
+    if (!title) {
+      return;
+    }
+
+    const filterableTitle = title.slice(0, 200);
+    const state = (langfuse as unknown as TurnMetadataState).traceState;
+    const span = state.latestTurnObservationsBySession.get(sessionID)?.span;
+    if (!span) {
+      return;
+    }
+
+    span.setAttribute(
+      "langfuse.trace.metadata.opencodeSessionRootTitle",
+      filterableTitle,
+    );
+    span.setAttribute(
+      "langfuse.observation.metadata.opencodeSessionRootTitle",
+      filterableTitle,
+    );
+    span.setAttribute("opencode.session.root_title", filterableTitle);
+  };
 
   const ensureSessionLineage = (sessionID: string): Promise<void> => {
     if (!sessionGrouping.enabled) {
@@ -556,6 +633,7 @@ const main = Effect.gen(function* () {
           return;
         }
 
+        rememberSessionInfo(info);
         langfuse.rememberSessionParent({
           sessionID: info.id,
           parentSessionID: info.parentID,
@@ -638,7 +716,12 @@ const main = Effect.gen(function* () {
     event: ({ event }) =>
       runHook(
         "event",
-        eventHook(event, shutdownOnce, ensureSessionLineage),
+        eventHook(
+          event,
+          shutdownOnce,
+          ensureSessionLineage,
+          rememberSessionInfo,
+        ),
       ),
 
     "chat.message": (input, output) =>
@@ -700,6 +783,10 @@ const main = Effect.gen(function* () {
               parts: output.parts,
               tools,
             });
+            annotateActiveTurnWithSessionTitle(
+              input.sessionID,
+              getRootSessionTitle(input.sessionID),
+            );
           });
         }),
       ),
